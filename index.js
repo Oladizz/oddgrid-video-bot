@@ -17,18 +17,23 @@ app.use(express.json());
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 async function processVideoMessage(message) {
-    if (!BOT_TOKEN) {
-        console.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set in the environment variables!");
-        return;
+    if (!message) return;
+    
+    try {
+        let fileId;
+    if (message.video) {
+        fileId = message.video.file_id;
+    } else if (message.document && message.document.mime_type && message.document.mime_type.startsWith('video/')) {
+        fileId = message.document.file_id;
+    } else if (message.animation) {
+        fileId = message.animation.file_id;
+    } else {
+        return; // Not a video
     }
 
-    try {
-        if (!message || !message.video) return;
-
-        const chatId = message.chat.id;
-        const fileId = message.video.file_id;
-        
-        // Parse requested frames from caption (e.g. "5" or "12")
+    const chatId = message.chat.id;
+    
+    // Parse requested frames from caption (e.g. "5" or "12")
         let requestedFrames = 5; // Default
         if (message.caption) {
             const match = message.caption.match(/(\d+)/);
@@ -140,21 +145,37 @@ if (process.env.NODE_ENV !== 'production') {
 
     let lastUpdateId = 0;
     
-    setInterval(async () => {
+    async function poll() {
         try {
             const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`);
             const data = await res.json();
             
             if (data.ok && data.result.length > 0) {
+                console.log(`[Dev Mode] Found ${data.result.length} new messages from Telegram!`);
                 for (const update of data.result) {
                     lastUpdateId = update.update_id;
+                    console.log(`[Dev Mode] Processing update ID:`, update.update_id);
                     if (update.message) {
-                        await processVideoMessage(update.message);
+                        const isVid = update.message.video || update.message.animation || (update.message.document && update.message.document.mime_type?.startsWith('video/'));
+                        if (isVid) {
+                            console.log(`[Dev Mode] Video detected! Processing...`);
+                            await processVideoMessage(update.message);
+                        } else {
+                            console.log(`[Dev Mode] Ignored non-video message:`, update.message.text || 'Text/Photo/Non-Video Document');
+                        }
                     }
                 }
+            } else if (!data.ok) {
+                console.error("[Dev Mode] Telegram API Error:", data.description);
             }
         } catch (e) {
-            // Ignore fetch timeouts
+            console.error("[Dev Mode] Network/Polling Error:", e);
         }
-    }, 2000);
+        
+        // Wait 1 second before next poll to prevent overlap
+        setTimeout(poll, 1000);
+    }
+    
+    // Start polling loop
+    poll();
 }
