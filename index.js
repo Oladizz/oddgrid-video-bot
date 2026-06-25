@@ -12,22 +12,53 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.post('/api/process-video-frames', async (req, res) => {
-    try {
-        const { fileId, frames, chatId, botToken } = req.body;
-        if (!fileId || !frames || !chatId || !botToken) {
-            return res.status(400).json({ error: 'Missing params' });
-        }
-        
-        // Return immediately so the Cloudflare Worker doesn't timeout (30s limit)
-        res.json({ success: true, message: 'Processing started' });
+// Set up the bot token from the environment variable (Render Secrets)
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
+// The independent webhook endpoint for Telegram
+app.post('/webhook', async (req, res) => {
+    // Acknowledge Telegram immediately so it doesn't retry
+    res.send('OK');
+
+    if (!BOT_TOKEN) {
+        console.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set in the environment variables!");
+        return;
+    }
+
+    try {
+        const message = req.body?.message;
+        if (!message || !message.video) return;
+
+        const chatId = message.chat.id;
+        const fileId = message.video.file_id;
+        
+        // Parse requested frames from caption (e.g. "5" or "12")
+        let requestedFrames = 5; // Default
+        if (message.caption) {
+            const match = message.caption.match(/(\d+)/);
+            if (match) {
+                const parsed = parseInt(match[1], 10);
+                if (parsed > 0 && parsed <= 60) requestedFrames = parsed;
+            }
+        }
+
+        // Notify user we received it directly
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: `⚙️ Video Received by Independent Bot!\n\nAutomatically extracting ${requestedFrames} frames. This might take a moment...`
+            })
+        });
+
+        // Setup temporary directory
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oddgrid-video-'));
         const vidPath = path.join(tmpDir, 'video.mp4');
 
         try {
             // 1. Get file path from Telegram
-            const fileRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+            const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
             const fileData = await fileRes.json();
             
             if (!fileData.ok) {
@@ -35,7 +66,7 @@ app.post('/api/process-video-frames', async (req, res) => {
             }
             
             const filePath = fileData.result.file_path;
-            const downloadUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+            const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
             
             // 2. Download video
             const vidReq = await fetch(downloadUrl);
@@ -44,28 +75,16 @@ app.post('/api/process-video-frames', async (req, res) => {
             fs.writeFileSync(vidPath, Buffer.from(buffer));
             
             // 3. Run ffmpeg
-            // Get duration
             const { stdout: durOut } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${vidPath}"`);
             const duration = parseFloat(durOut.trim());
-            const fps = frames / duration;
+            const fps = requestedFrames / duration;
             
             await execAsync(`ffmpeg -i "${vidPath}" -vf fps=${fps} "${tmpDir}/frame_%03d.jpg"`);
             
             const files = fs.readdirSync(tmpDir).filter(f => f.startsWith('frame_')).sort();
-            
-            // Limit to requested frames
-            const framesToSend = files.slice(0, frames);
+            const framesToSend = files.slice(0, requestedFrames);
 
-            await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    text: `✅ Extraction complete! Sending ${framesToSend.length} frames...`
-                })
-            });
-
-            // Send each frame
+            // Send each frame back to Telegram
             for (const frameFile of framesToSend) {
                 const formData = new FormData();
                 formData.append('chat_id', chatId);
@@ -74,7 +93,7 @@ app.post('/api/process-video-frames', async (req, res) => {
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 formData.append('photo', blob, frameFile);
 
-                await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
                     method: 'POST',
                     body: formData
                 });
@@ -82,7 +101,7 @@ app.post('/api/process-video-frames', async (req, res) => {
 
         } catch (err) {
             console.error("Frame extraction error:", err);
-            await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -91,11 +110,10 @@ app.post('/api/process-video-frames', async (req, res) => {
                 })
             });
         } finally {
-            // Clean up temporary files
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     } catch (e) {
-        console.error("Critical Express Route Error:", e);
+        console.error("Critical Webhook Error:", e);
     }
 });
 
