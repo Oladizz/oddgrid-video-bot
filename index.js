@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { exec } = require('child_process');
@@ -15,18 +16,13 @@ app.use(express.json());
 // Set up the bot token from the environment variable (Render Secrets)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-// The independent webhook endpoint for Telegram
-app.post('/webhook', async (req, res) => {
-    // Acknowledge Telegram immediately so it doesn't retry
-    res.send('OK');
-
+async function processVideoMessage(message) {
     if (!BOT_TOKEN) {
         console.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set in the environment variables!");
         return;
     }
 
     try {
-        const message = req.body?.message;
         if (!message || !message.video) return;
 
         const chatId = message.chat.id;
@@ -113,14 +109,52 @@ app.post('/webhook', async (req, res) => {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     } catch (e) {
-        console.error("Critical Webhook Error:", e);
+        console.error("Critical Processing Error:", e);
     }
-});
+}
 
-// Health check endpoint
-app.get('/health', (req, res) => res.json({ status: 'ok', ffmpeg: 'ready' }));
+// ==========================================
+// 1. PRODUCTION MODE (Webhook)
+// ==========================================
+app.post('/webhook', async (req, res) => {
+    res.send('OK'); // Acknowledge Telegram immediately
+    const message = req.body?.message;
+    if (message) await processVideoMessage(message);
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Video Bot Extraction Backend running on port ${PORT}`);
+    console.log(`[Express] Video Bot running on port ${PORT}`);
 });
+
+// ==========================================
+// 2. LOCAL DEV MODE (Long Polling)
+// ==========================================
+if (process.env.NODE_ENV !== 'production') {
+    console.log(`[Dev Mode] Starting local long-polling... No ngrok/pinggy needed!`);
+    
+    // Delete any lingering webhook
+    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`)
+        .then(() => console.log("[Dev Mode] Webhook removed for local testing."))
+        .catch(e => console.error(e));
+
+    let lastUpdateId = 0;
+    
+    setInterval(async () => {
+        try {
+            const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`);
+            const data = await res.json();
+            
+            if (data.ok && data.result.length > 0) {
+                for (const update of data.result) {
+                    lastUpdateId = update.update_id;
+                    if (update.message) {
+                        await processVideoMessage(update.message);
+                    }
+                }
+            }
+        } catch (e) {
+            // Ignore fetch timeouts
+        }
+    }, 2000);
+}
